@@ -1,186 +1,113 @@
-/************************************************************************
-*   IRC - Internet Relay Chat, src/whowas.c
-*   Copyright (C) 1990 Markku Savela
-*
-*   This program is free software; you can redistribute it and/or modify
-*   it under the terms of the GNU General Public License as published by
-*   the Free Software Foundation; either version 1, or (at your option)
-*   any later version.
-*
-*   This program is distributed in the hope that it will be useful,
-*   but WITHOUT ANY WARRANTY; without even the implied warranty of
-*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*   GNU General Public License for more details.
-*
-*   You should have received a copy of the GNU General Public License
-*   along with this program; if not, write to the Free Software
-*   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
-*/
+/*
+ *   IRC - Internet Relay Chat, src/modules/out.c
+ *   (C) 2004 The UnrealIRCd Team
+ *
+ *   See file AUTHORS in IRC package for additional names of
+ *   the programmers.
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 1, or (at your option)
+ *   any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
 
 #include "unrealircd.h"
 
-// FIXME: move this to cmd_whowas,
-// Consider making add_history an efunc? Or via a hook?
-// Some users may not want to load cmd_whowas at all.
+CMD_FUNC(cmd_whowas);
 
-/* internally defined function */
-static void add_whowas_to_clist(aWhowas **, aWhowas *);
-static void del_whowas_from_clist(aWhowas **, aWhowas *);
-static void add_whowas_to_list(aWhowas **, aWhowas *);
-static void del_whowas_from_list(aWhowas **, aWhowas *);
+#define MSG_WHOWAS 	"WHOWAS"	
 
-aWhowas MODVAR WHOWAS[NICKNAMEHISTORYLENGTH];
-aWhowas MODVAR *WHOWASHASH[WHOWAS_HASH_TABLE_SIZE];
+ModuleHeader MOD_HEADER
+  = {
+	"whowas",
+	"5.0",
+	"command /whowas", 
+	"UnrealIRCd Team",
+	"unrealircd-5",
+    };
 
-MODVAR int whowas_next = 0;
-
-void add_history(Client *client, int online)
+MOD_INIT()
 {
-	aWhowas *new;
-
-	new = &WHOWAS[whowas_next];
-
-	if (new->hashv != -1)
-	{
-		safe_free(new->name);
-		safe_free(new->hostname);
-		safe_free(new->virthost);
-		safe_free(new->realname);
-		safe_free(new->username);
-		new->servername = NULL;
-
-		if (new->online)
-			del_whowas_from_clist(&(new->online->user->whowas), new);
-		del_whowas_from_list(&WHOWASHASH[new->hashv], new);
-	}
-	new->hashv = hash_whowas_name(client->name);
-	new->logoff = TStime();
-	new->umodes = client->umodes;
-	safe_strdup(new->name, client->name);
-	safe_strdup(new->username, client->user->username);
-	safe_strdup(new->hostname, client->user->realhost);
-	if (client->user->virthost)
-		safe_strdup(new->virthost, client->user->virthost);
-	else
-		safe_strdup(new->virthost, "");
-	new->servername = client->user->server;
-	safe_strdup(new->realname, client->info);
-
-	/* Its not string copied, a pointer to the scache hash is copied
-	   -Dianora
-	 */
-	/*  strlcpy(new->servername, client->user->server,HOSTLEN); */
-	new->servername = client->user->server;
-
-	if (online)
-	{
-		new->online = client;
-		add_whowas_to_clist(&(client->user->whowas), new);
-	}
-	else
-		new->online = NULL;
-	add_whowas_to_list(&WHOWASHASH[new->hashv], new);
-	whowas_next++;
-	if (whowas_next == NICKNAMEHISTORYLENGTH)
-		whowas_next = 0;
+	CommandAdd(modinfo->handle, MSG_WHOWAS, cmd_whowas, MAXPARA, CMD_USER);
+	MARK_AS_OFFICIAL_MODULE(modinfo);
+	return MOD_SUCCESS;
 }
 
-void off_history(Client *client)
+MOD_LOAD()
 {
-	aWhowas *temp, *next;
-
-	for (temp = client->user->whowas; temp; temp = next)
-	{
-		next = temp->cnext;
-		temp->online = NULL;
-		del_whowas_from_clist(&(client->user->whowas), temp);
-	}
+	return MOD_SUCCESS;
 }
 
-Client *get_history(char *nick, time_t timelimit)
+MOD_UNLOAD()
+{
+	return MOD_SUCCESS;
+}
+
+/* externally defined functions */
+extern aWhowas MODVAR WHOWAS[NICKNAMEHISTORYLENGTH];
+extern aWhowas MODVAR *WHOWASHASH[WHOWAS_HASH_TABLE_SIZE];
+
+/*
+** cmd_whowas
+**      parv[1] = nickname queried
+*/
+CMD_FUNC(cmd_whowas)
 {
 	aWhowas *temp;
-	int  blah;
+	int  cur = 0;
+	int  max = -1, found = 0;
+	char *p, *nick;
 
-	timelimit = TStime() - timelimit;
-	blah = hash_whowas_name(nick);
-	temp = WHOWASHASH[blah];
+	if (parc < 2)
+	{
+		sendnumeric(client, ERR_NONICKNAMEGIVEN);
+		return;
+	}
+	if (parc > 2)
+		max = atoi(parv[2]);
+	if (parc > 3)
+		if (hunt_server(client, recv_mtags, ":%s WHOWAS %s %s :%s", 3, parc, parv))
+			return;
+
+	if (!MyConnect(client) && (max > 20))
+		max = 20;
+
+	p = strchr(parv[1], ',');
+	if (p)
+		*p = '\0';
+	nick = parv[1];
+	temp = WHOWASHASH[hash_whowas_name(nick)];
+	found = 0;
 	for (; temp; temp = temp->next)
 	{
-		if (mycmp(nick, temp->name))
-			continue;
-		if (temp->logoff < timelimit)
-			continue;
-		return temp->online;
-	}
-	return NULL;
-}
-
-void count_whowas_memory(int *wwu, u_long *wwum)
-{
-	aWhowas *tmp;
-	int  i;
-	int  u = 0;
-	u_long um = 0;
-	/* count the number of used whowas structs in 'u' */
-	/* count up the memory used of whowas structs in um */
-
-	for (i = 0, tmp = &WHOWAS[0]; i < NICKNAMEHISTORYLENGTH; i++, tmp++)
-		if (tmp->hashv != -1)
+		if (!mycmp(nick, temp->name))
 		{
-			u++;
-			um += sizeof(aWhowas);
+			sendnumeric(client, RPL_WHOWASUSER, temp->name,
+			    temp->username,
+			    (IsOper(client) ? temp->hostname :
+			    (*temp->virthost !=
+			    '\0') ? temp->virthost : temp->hostname),
+			    temp->realname);
+                	if (!((find_uline(temp->servername)) && !IsOper(client) && HIDE_ULINES))
+				sendnumeric(client, RPL_WHOISSERVER, temp->name, temp->servername,
+				    myctime(temp->logoff));
+			cur++;
+			found++;
 		}
-	*wwu = u;
-	*wwum = um;
-	return;
-}
-
-void initwhowas()
-{
-	int  i;
-
-	for (i = 0; i < NICKNAMEHISTORYLENGTH; i++)
-	{
-		memset(&WHOWAS[i], 0, sizeof(aWhowas));
-		WHOWAS[i].hashv = -1;
+		if (max > 0 && cur >= max)
+			break;
 	}
-	for (i = 0; i < WHOWAS_HASH_TABLE_SIZE; i++)
-		WHOWASHASH[i] = NULL;
-}
+	if (!found)
+		sendnumeric(client, ERR_WASNOSUCHNICK, nick);
 
-static void add_whowas_to_clist(aWhowas ** bucket, aWhowas * whowas)
-{
-	whowas->cprev = NULL;
-	if ((whowas->cnext = *bucket) != NULL)
-		whowas->cnext->cprev = whowas;
-	*bucket = whowas;
-}
-
-static void del_whowas_from_clist(aWhowas ** bucket, aWhowas * whowas)
-{
-	if (whowas->cprev)
-		whowas->cprev->cnext = whowas->cnext;
-	else
-		*bucket = whowas->cnext;
-	if (whowas->cnext)
-		whowas->cnext->cprev = whowas->cprev;
-}
-
-static void add_whowas_to_list(aWhowas ** bucket, aWhowas * whowas)
-{
-	whowas->prev = NULL;
-	if ((whowas->next = *bucket) != NULL)
-		whowas->next->prev = whowas;
-	*bucket = whowas;
-}
-
-static void del_whowas_from_list(aWhowas ** bucket, aWhowas * whowas)
-{
-	if (whowas->prev)
-		whowas->prev->next = whowas->next;
-	else
-		*bucket = whowas->next;
-	if (whowas->next)
-		whowas->next->prev = whowas->prev;
+	sendnumeric(client, RPL_ENDOFWHOWAS, parv[1]);
 }
