@@ -1,7 +1,9 @@
-/************************************************************************
- *   Unreal Internet Relay Chat, src/list.c
- *   Copyright (C) 1990 Jarkko Oikarinen and
- *                      University of Oulu, Finland
+/*
+ *   IRC - Internet Relay Chat, src/modules/list.c
+ *   (C) 2004 The UnrealIRCd Team
+ *
+ *   See file AUTHORS in IRC package for additional names of
+ *   the programmers.
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -20,586 +22,463 @@
 
 #include "unrealircd.h"
 
-void free_link(Link *);
-Link *make_link();
+CMD_FUNC(cmd_list);
+int send_list(Client *client);
 
-ID_Copyright
-    ("(C) 1988 University of Oulu, Computing Center and Jarkko Oikarinen");
-ID_Notes("2.24 4/20/94");
+#define MSG_LIST 	"LIST"	
 
-#ifdef	DEBUGMODE
-static struct liststats {
-	int  inuse;
-} cloc, crem, users, servs, links;
+ModuleHeader MOD_HEADER
+  = {
+	"list",
+	"5.0",
+	"command /list", 
+	"UnrealIRCd Team",
+	"unrealircd-5",
+    };
 
-#endif
+typedef struct ChannelListOptions ChannelListOptions;
+struct ChannelListOptions {
+	NameList *yeslist;
+	NameList *nolist;
+	unsigned int starthash;
+	short int showall;
+	unsigned short usermin;
+	int  usermax;
+	time_t currenttime;
+	time_t chantimemin;
+	time_t chantimemax;
+	time_t topictimemin;
+	time_t topictimemax;
+	void *lr_context;
+};
 
-MODVAR int  flinks = 0;
-MODVAR int  freelinks = 0;
-MODVAR Link *freelink = NULL;
-MODVAR Member *freemember = NULL;
-MODVAR Membership *freemembership = NULL;
-MODVAR int  numclients = 0;
+/* Global variables */
+ModDataInfo *list_md = NULL;
 
-// TODO: Document whether servers are included or excluded in these lists...
+/* Macros */
+#define CHANNELLISTOPTIONS(x)       ((ChannelListOptions *)moddata_local_client(x, list_md).ptr)
+#define ALLOCATE_CHANNELLISTOPTIONS(client)	do { moddata_local_client(client, list_md).ptr = safe_alloc(sizeof(ChannelListOptions)); } while(0)
+#define free_list_options(client)		list_md_free(&moddata_local_client(client, list_md))
 
-MODVAR struct list_head unknown_list;		/**< Local clients in handshake (may become a user or server later) */
-MODVAR struct list_head lclient_list;		/**< Local clients (users only, right?) */
-MODVAR struct list_head client_list;		/**< All clients - local and remote (not in handshake) */
-MODVAR struct list_head server_list;		/**< Locally connected servers */
-MODVAR struct list_head oper_list;		/**< Locally connected IRC Operators */
-MODVAR struct list_head global_server_list;	/**< All servers (local and remote) */
-MODVAR struct list_head dead_list;		/**< All dead clients (local and remote) that will soon be freed in the main loop */
+#define DoList(x)               (MyUser((x)) && CHANNELLISTOPTIONS((x)))
+#define IsSendable(x)		(DBufLength(&x->local->sendQ) < 2048)
 
-static mp_pool_t *client_pool = NULL;
-static mp_pool_t *local_client_pool = NULL;
-static mp_pool_t *user_pool = NULL;
-static mp_pool_t *link_pool = NULL;
+/* Forward declarations */
+EVENT(send_queued_list_data);
+void list_md_free(ModData *md);
 
-void initlists(void)
+MOD_TEST()
 {
-#ifdef	DEBUGMODE
-	memset(&cloc, 0, sizeof(cloc));
-	memset(&crem, 0, sizeof(crem));
-	memset(&users, 0, sizeof(users));
-	memset(&servs, 0, sizeof(servs));
-	memset(&links, 0, sizeof(links));
-#endif
-
-	INIT_LIST_HEAD(&client_list);
-	INIT_LIST_HEAD(&lclient_list);
-	INIT_LIST_HEAD(&server_list);
-	INIT_LIST_HEAD(&oper_list);
-	INIT_LIST_HEAD(&unknown_list);
-	INIT_LIST_HEAD(&global_server_list);
-	INIT_LIST_HEAD(&dead_list);
-
-	client_pool = mp_pool_new(sizeof(Client), 512 * 1024);
-	local_client_pool = mp_pool_new(sizeof(LocalClient), 512 * 1024);
-	user_pool = mp_pool_new(sizeof(User), 512 * 1024);
-	link_pool = mp_pool_new(sizeof(Link), 512 * 1024);
+	MARK_AS_OFFICIAL_MODULE(modinfo);
+	return MOD_SUCCESS;
 }
+
+MOD_INIT()
+{
+	ModDataInfo mreq;
+
+	MARK_AS_OFFICIAL_MODULE(modinfo);
+
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.name = "list";
+	mreq.type = MODDATATYPE_LOCAL_CLIENT;
+	mreq.free = list_md_free;
+	list_md = ModDataAdd(modinfo->handle, mreq);
+	if (!list_md)
+	{
+		config_error("could not register list moddata");
+		return MOD_FAILED;
+	}
+
+	CommandAdd(modinfo->handle, MSG_LIST, cmd_list, MAXPARA, CMD_USER);
+	EventAdd(modinfo->handle, "send_queued_list_data", send_queued_list_data, NULL, 1500, 0);
+
+	return MOD_SUCCESS;
+}
+
+MOD_LOAD()
+{
+	return MOD_SUCCESS;
+}
+
+MOD_UNLOAD()
+{
+	return MOD_SUCCESS;
+}
+
+/* Originally from bahamut, modified a bit for Unreal by codemastr
+ * also Opers can now see +s channels -- codemastr */
 
 /*
-** Create a new Client structure and set it to initial state.
-**
-**	from == NULL,	create local client (a client connected
-**			to a socket).
-**
-**	from,	create remote client (behind a socket
-**			associated with the client defined by
-**			'from'). ('from' is a local client!!).
-*/
-Client *make_client(Client *from, Client *servr)
-{
-	Client *client = mp_pool_get(client_pool);
-	memset(client, 0, sizeof(Client));
-
-#ifdef	DEBUGMODE
-	if (!from)
-		cloc.inuse++;
-	else
-		crem.inuse++;
-#endif
-
-	/* Note: all fields are already NULL/0, no need to set here */
-	client->direction = from ? from : client;	/* 'from' of local client is self! */
-	client->srvptr = servr;
-	client->status = CLIENT_STATUS_UNKNOWN;
-
-	INIT_LIST_HEAD(&client->client_node);
-	INIT_LIST_HEAD(&client->client_hash);
-	INIT_LIST_HEAD(&client->id_hash);
-
-	strcpy(client->ident, "unknown");
-	if (!from)
-	{
-		/* Local client */
-		const char *id;
-		
-		client->local = mp_pool_get(local_client_pool);
-		memset(client->local, 0, sizeof(LocalClient));
-		
-		INIT_LIST_HEAD(&client->lclient_node);
-		INIT_LIST_HEAD(&client->special_node);
-
-		client->local->since = client->local->lasttime =
-		client->lastnick = client->local->firsttime =
-		client->local->last = TStime();
-		client->local->class = NULL;
-		client->local->passwd = NULL;
-		client->local->sockhost[0] = '\0';
-		client->local->authfd = -1;
-		client->local->fd = -1;
-
-		dbuf_queue_init(&client->local->recvQ);
-		dbuf_queue_init(&client->local->sendQ);
-
-		while (hash_find_id((id = uid_get()), NULL) != NULL)
-			;
-		strlcpy(client->id, id, sizeof client->id);
-		add_to_id_hash_table(client->id, client);
-	}
-	return client;
-}
-
-void free_client(Client *client)
-{
-	if (!list_empty(&client->client_node))
-		list_del(&client->client_node);
-
-	if (MyConnect(client))
-	{
-		if (!list_empty(&client->lclient_node))
-			list_del(&client->lclient_node);
-		if (!list_empty(&client->special_node))
-			list_del(&client->special_node);
-
-		RunHook(HOOKTYPE_FREE_CLIENT, client);
-		if (client->local)
-		{
-			safe_free(client->local->passwd);
-			safe_free(client->local->error_str);
-			if (client->local->hostp)
-				unreal_free_hostent(client->local->hostp);
-			
-			mp_pool_release(client->local);
-		}
-		if (*client->id)
-		{
-			/* This is already del'd in exit_one_client, so we
-			 * only have it here in case a shortcut was taken,
-			 * such as from add_connection() to free_client().
-			 */
-			del_from_id_hash_table(client->id, client);
-		}
-	}
-	
-	safe_free(client->ip);
-
-	mp_pool_release(client);
-}
-
-/*
-** 'make_user' add's an User information block to a client
-** if it was not previously allocated.
-*/
-User *make_user(Client *client)
-{
-	User *user;
-
-	user = client->user;
-	if (!user)
-	{
-		user = mp_pool_get(user_pool);
-		memset(user, 0, sizeof(User));
-
-#ifdef	DEBUGMODE
-		users.inuse++;
-#endif
-		strlcpy(user->svid, "0", sizeof(user->svid));
-		if (client->ip)
-		{
-			/* initially set client->user->realhost to IP */
-			strlcpy(user->realhost, client->ip, sizeof(user->realhost));
-		} else {
-			*user->realhost = '\0';
-		}
-		user->virthost = NULL;
-		client->user = user;		
-	}
-	return user;
-}
-
-Server *make_server(Client *client)
-{
-	Server *serv = client->serv;
-
-	if (!serv)
-	{
-		serv = safe_alloc(sizeof(Server));
-#ifdef	DEBUGMODE
-		servs.inuse++;
-#endif
-		*serv->by = '\0';
-		serv->users = 0;
-		serv->up = NULL;
-		client->serv = serv;
-	}
-	if (strlen(client->id) > 3)
-	{
-		/* Probably the auto-generated UID for a server that
-		 * still uses the old protocol (without SID).
-		 */
-		del_from_id_hash_table(client->id, client);
-		*client->id = '\0';
-	}
-	return client->serv;
-}
-
-/*
-** free_user
-**	Decrease user reference count by one and realease block,
-**	if count reaches 0
-*/
-void free_user(Client *client)
-{
-	RunHook(HOOKTYPE_FREE_USER, client);
-	safe_free(client->user->away);
-	if (client->user->swhois)
-	{
-		SWhois *s, *s_next;
-		for (s = client->user->swhois; s; s = s_next)
-		{
-			s_next = s->next;
-			safe_free(s->line);
-			safe_free(s->setby);
-			safe_free(s);
-		}
-		client->user->swhois = NULL;
-	}
-	safe_free(client->user->virthost);
-	safe_free(client->user->operlogin);
-	mp_pool_release(client->user);
-#ifdef	DEBUGMODE
-	users.inuse--;
-#endif
-	client->user = NULL;
-}
-
-/*
- * taken the code from ExitOneClient() for this and placed it here.
- * - avalon
+ * parv[1] = channel
  */
-void remove_client_from_list(Client *client)
+CMD_FUNC(cmd_list)
 {
-	list_del(&client->client_node);
-	if (MyConnect(client))
+	Channel *channel;
+	time_t currenttime = TStime();
+	char *name, *p = NULL;
+	ChannelListOptions *lopt = NULL;
+	int usermax, usermin, error = 0, doall = 0;
+	time_t chantimemin, chantimemax;
+	time_t topictimemin, topictimemax;
+	NameList *yeslist = NULL;
+	NameList *nolist = NULL;
+	int ntargets = 0;
+	int maxtargets = max_targets_for_command("LIST");
+
+	static char *usage[] = {
+		"   Usage: /LIST <options>",
+		"",
+		"If you don't include any options, the default is to send you the",
+		"entire unfiltered list of channels. Below are the options you can",
+		"use, and what channels LIST will return when you use them.",
+		">number  List channels with more than <number> people.",
+		"<number  List channels with less than <number> people.",
+		"C>number List channels created between now and <number> minutes ago.",
+		"C<number List channels created earlier than <number> minutes ago.",
+		"T>number List channels whose topics are older than <number> minutes",
+		"         (Ie, they have not changed in the last <number> minutes.",
+		"T<number List channels whose topics are not older than <number> minutes.",
+		"*mask*   List channels that match *mask*",
+		"!*mask*  List channels that do not match *mask*",
+		NULL
+	};
+
+	/* Remote /LIST is not supported */
+	if (!MyUser(client))
+		return;
+
+	/* If a /LIST is in progress then a new one will cancel it */
+	if (CHANNELLISTOPTIONS(client))
 	{
-		if (!list_empty(&client->lclient_node))
-			list_del(&client->lclient_node);
-		if (!list_empty(&client->special_node))
-			list_del(&client->special_node);
-	}
-	if (IsServer(client))
-	{
-		irccounts.servers--;
-	}
-	if (IsUser(client))
-	{
-		if (IsInvisible(client))
-		{
-			irccounts.invisible--;
-		}
-		if (IsOper(client) && !IsHideOper(client))
-		{
-			irccounts.operators--;
-			VERIFY_OPERCOUNT(client, "rmvlist");
-		}
-		irccounts.clients--;
-		if (client->srvptr && client->srvptr->serv)
-			client->srvptr->serv->users--;
-	}
-	if (IsUnknown(client) || IsConnecting(client) || IsHandshake(client)
-		|| IsTLSHandshake(client)
-	)
-		irccounts.unknown--;
-
-	if (IsUser(client))	/* Only persons can have been added before */
-	{
-		add_history(client, 0);
-		off_history(client);	/* Remove all pointers to client */
-	}
-	
-	if (client->user)
-		free_user(client);
-	if (client->serv)
-	{
-		safe_free(client->serv->features.usermodes);
-		safe_free(client->serv->features.chanmodes[0]);
-		safe_free(client->serv->features.chanmodes[1]);
-		safe_free(client->serv->features.chanmodes[2]);
-		safe_free(client->serv->features.chanmodes[3]);
-		safe_free(client->serv->features.software);
-		safe_free(client->serv->features.nickchars);
-		safe_free(client->serv);
-#ifdef	DEBUGMODE
-		servs.inuse--;
-#endif
-	}
-#ifdef	DEBUGMODE
-	if (client->local && client->local->fd == -2)
-		cloc.inuse--;
-	else
-		crem.inuse--;
-#endif
-	if (!list_empty(&client->client_node))
-		abort();
-	if (!list_empty(&client->client_hash))
-		abort();
-	if (!list_empty(&client->id_hash))
-		abort();
-	numclients--;
-	/* Add to killed clients list */
-	list_add(&client->client_node, &dead_list);
-	// THIS IS NOW DONE IN THE MAINLOOP --> free_client(client);
-	SetDead(client);
-	SetDeadSocket(client);
-	return;
-}
-
-/*
- * although only a small routine, it appears in a number of places
- * as a collection of a few lines...functions like this *should* be
- * in this file, shouldnt they ?  after all, this is list.c, isnt it ?
- * -avalon
- */
-void add_client_to_list(Client *client)
-{
-	list_add(&client->client_node, &client_list);
-}
-
-/** Make a new link entry.
- * @note  When you no longer need it, call free_link()
- *        NEVER call free() or safe_free() on it.
- */
-Link *make_link(void)
-{
-	Link *l = mp_pool_get(link_pool);
-	memset(l, 0, sizeof(Link));
-#ifdef	DEBUGMODE
-	links.inuse++;
-#endif
-	return l;
-}
-
-/** Releases a link that was previously created with make_link() */
-void free_link(Link *lp)
-{
-	mp_pool_release(lp);
-
-#ifdef	DEBUGMODE
-	links.inuse--;
-#endif
-}
-
-Ban *make_ban(void)
-{
-	Ban *lp;
-
-	lp = safe_alloc(sizeof(Ban));
-#ifdef	DEBUGMODE
-	links.inuse++;
-#endif
-	return lp;
-}
-
-void free_ban(Ban *lp)
-{
-	safe_free(lp);
-#ifdef	DEBUGMODE
-	links.inuse--;
-#endif
-}
-
-void add_ListItem(ListStruct *item, ListStruct **list)
-{
-	item->next = *list;
-	item->prev = NULL;
-	if (*list)
-		(*list)->prev = item;
-	*list = item;
-}
-
-/* (note that if you end up using this, you should probably
- *  use a circular linked list instead)
- */
-void append_ListItem(ListStruct *item, ListStruct **list)
-{
-	ListStruct *l;
-
-	if (!*list)
-	{
-		*list = item;
+		sendnumeric(client, RPL_LISTEND);
+		free_list_options(client);
 		return;
 	}
 
-	for (l = *list; l->next; l = l->next);
-	l->next = item;
-	item->prev = l;
-}
-
-void del_ListItem(ListStruct *item, ListStruct **list)
-{
-	if (!item)
-		return;
-
-	if (item->prev)
-		item->prev->next = item->next;
-	if (item->next)
-		item->next->prev = item->prev;
-	if (*list == item)
-		*list = item->next; /* new head */
-	/* And update 'item', prev/next should point nowhere anymore */
-	item->prev = item->next = NULL;
-}
-
-/** Add item to list with a 'priority'.
- * If there are multiple items with the same priority then it will be
- * added as the last item within.
- */
-void add_ListItemPrio(ListStructPrio *new, ListStructPrio **list, int priority)
-{
-	ListStructPrio *x, *last = NULL;
-	
-	if (!*list)
+	if (parc < 2 || BadPtr(parv[1]))
 	{
-		/* We are the only item. Easy. */
-		*list = new;
+		sendnumeric(client, RPL_LISTSTART);
+		ALLOCATE_CHANNELLISTOPTIONS(client);
+		CHANNELLISTOPTIONS(client)->showall = 1;
+
+		if (send_list(client))
+		{
+			/* Save context since there is more to be sent */
+			CHANNELLISTOPTIONS(client)->lr_context = labeled_response_save_context();
+			labeled_response_inhibit_end = 1;
+		}
+
 		return;
 	}
-	
-	for (x = *list; x; x = x->next)
+
+	if ((parc == 2) && (parv[1][0] == '?') && (parv[1][1] == '\0'))
 	{
-		last = x;
-		if (x->priority >= priority)
+		char **ptr = usage;
+		for (; *ptr; ptr++)
+			sendnumeric(client, RPL_LISTSYNTAX, *ptr);
+		return;
+	}
+
+	sendnumeric(client, RPL_LISTSTART);
+
+	chantimemax = topictimemax = currenttime + 86400;
+	chantimemin = topictimemin = 0;
+	usermin = 0;		/* Minimum of 0 */
+	usermax = -1;		/* No maximum */
+
+	for (name = strtoken(&p, parv[1], ","); name && !error;
+	    name = strtoken(&p, NULL, ","))
+	{
+		if (MyUser(client) && (++ntargets > maxtargets))
+		{
+			sendnumeric(client, ERR_TOOMANYTARGETS, name, maxtargets, "LIST");
+			break;
+		}
+		switch (*name)
+		{
+		  case '<':
+			  usermax = atoi(name + 1) - 1;
+			  doall = 1;
+			  break;
+		  case '>':
+			  usermin = atoi(name + 1) + 1;
+			  doall = 1;
+			  break;
+		  case 'C':
+		  case 'c':	/* Channel time -- creation time? */
+			  ++name;
+			  switch (*name++)
+			  {
+			    case '<':
+				    chantimemax = currenttime - 60 * atoi(name);
+				    doall = 1;
+				    break;
+			    case '>':
+				    chantimemin = currenttime - 60 * atoi(name);
+				    doall = 1;
+				    break;
+			    default:
+				    sendnumeric(client, ERR_LISTSYNTAX);
+				    error = 1;
+			  }
+			  break;
+#ifdef LIST_USE_T
+		  case 'T':
+		  case 't':
+			  ++name;
+			  switch (*name++)
+			  {
+			    case '<':
+				    topictimemax =
+					currenttime - 60 * atoi(name);
+				    doall = 1;
+				    break;
+			    case '>':
+				    topictimemin =
+					currenttime - 60 * atoi(name);
+				    doall = 1;
+				    break;
+			    default:
+				    sendnumeric(client, ERR_LISTSYNTAX,
+					"Bad list syntax, type /list ?");
+				    error = 1;
+			  }
+			  break;
+#endif
+		  default:	/* A channel, possibly with wildcards.
+				 * Thought for the future: Consider turning wildcard
+				 * processing on the fly.
+				 * new syntax: !channelmask will tell ircd to ignore
+				 * any channels matching that mask, and then
+				 * channelmask will tell ircd to send us a list of
+				 * channels only masking channelmask. Note: Specifying
+				 * a channel without wildcards will return that
+				 * channel even if any of the !channelmask masks
+				 * matches it.
+				 */
+			  if (*name == '!')
+			  {
+				  doall = 1;
+				  add_name_list(nolist, name + 1);
+			  }
+			  else if (strchr(name, '*') || strchr(name, '?'))
+			  {
+				  doall = 1;
+				  add_name_list(yeslist, name);
+			  }
+			  else	/* Just a normal channel */
+			  {
+				  channel = find_channel(name, NULL);
+				  if (channel && (ShowChannel(client, channel) || ValidatePermissionsForPath("channel:see:list:secret",client,NULL,channel,NULL))) {
+#ifdef LIST_SHOW_MODES
+					modebuf[0] = '[';
+					channel_modes(client, modebuf+1, parabuf, sizeof(modebuf)-1, sizeof(parabuf), channel, 0);
+					if (modebuf[2] == '\0')
+						modebuf[0] = '\0';
+					else
+						strlcat(modebuf, "]", sizeof modebuf);
+#endif
+					  sendnumeric(client, RPL_LIST,
+					      name, channel->users,
+#ifdef LIST_SHOW_MODES
+					      modebuf,
+#endif
+					      (channel->topic ? channel->topic :
+					      ""));
+}
+			  }
+		}		/* switch */
+	}			/* while */
+
+	if (doall)
+	{
+		ALLOCATE_CHANNELLISTOPTIONS(client);
+		CHANNELLISTOPTIONS(client)->usermin = usermin;
+		CHANNELLISTOPTIONS(client)->usermax = usermax;
+		CHANNELLISTOPTIONS(client)->topictimemax = topictimemax;
+		CHANNELLISTOPTIONS(client)->topictimemin = topictimemin;
+		CHANNELLISTOPTIONS(client)->chantimemax = chantimemax;
+		CHANNELLISTOPTIONS(client)->chantimemin = chantimemin;
+		CHANNELLISTOPTIONS(client)->nolist = nolist;
+		CHANNELLISTOPTIONS(client)->yeslist = yeslist;
+
+		if (send_list(client))
+		{
+			/* Save context since there is more to be sent */
+			CHANNELLISTOPTIONS(client)->lr_context = labeled_response_save_context();
+			labeled_response_inhibit_end = 1;
+		}
+		return;
+	}
+
+	sendnumeric(client, RPL_LISTEND);
+}
+/*
+ * The function which sends the actual channel list back to the user.
+ * Operates by stepping through the hashtable, sending the entries back if
+ * they match the criteria.
+ * client = Local client to send the output back to.
+ * Taken from bahamut, modified for Unreal by codemastr.
+ */
+int send_list(Client *client)
+{
+	Channel *channel;
+	ChannelListOptions *lopt = CHANNELLISTOPTIONS(client);
+	unsigned int  hashnum;
+	int numsend = (get_sendq(client) / 768) + 1; /* (was previously hard-coded) */
+	/* ^
+	 * numsend = Number (roughly) of lines to send back. Once this number has
+	 * been exceeded, send_list will finish with the current hash bucket,
+	 * and record that number as the number to start next time send_list
+	 * is called for this user. So, this function will almost always send
+	 * back more lines than specified by numsend (though not by much,
+	 * assuming the hashing algorithm works well). Be conservative in your
+	 * choice of numsend. -Rak
+	 */	
+
+	/* Begin of /list? then send official channels. */
+	if ((lopt->starthash == 0) && conf_offchans)
+	{
+		ConfigItem_offchans *x;
+		for (x = conf_offchans; x; x = x->next)
+		{
+			if (find_channel(x->chname, NULL))
+				continue; /* exists, >0 users.. will be sent later */
+			sendnumeric(client, RPL_LIST, x->chname,
+			    0,
+#ifdef LIST_SHOW_MODES
+			    "",
+#endif					    
+			    x->topic ? x->topic : "");
+		}
+	}
+
+	for (hashnum = lopt->starthash; hashnum < CHAN_HASH_TABLE_SIZE; hashnum++)
+	{
+		if (numsend > 0)
+			for (channel = hash_get_chan_bucket(hashnum);
+			    channel; channel = channel->hnextch)
+			{
+				if (SecretChannel(channel)
+				    && !IsMember(client, channel)
+				    && !ValidatePermissionsForPath("channel:see:list:secret",client,NULL,channel,NULL))
+					continue;
+
+				/* set::hide-list { deny-channel } */
+				if (!IsOper(client) && iConf.hide_list && find_channel_allowed(client, channel->chname))
+					continue;
+
+				/* Similarly, hide unjoinable channels for non-ircops since it would be confusing */
+				if (!IsOper(client) && !valid_channelname(channel->chname))
+					continue;
+
+				/* Much more readable like this -- codemastr */
+				if ((!lopt->showall))
+				{
+					/* User count must be in range */
+					if ((channel->users < lopt->usermin) || 
+					    ((lopt->usermax >= 0) && (channel->users > 
+					    lopt->usermax)))
+						continue;
+
+					/* Creation time must be in range */
+					if ((channel->creationtime && (channel->creationtime <
+					    lopt->chantimemin)) || (channel->creationtime >
+					    lopt->chantimemax))
+						continue;
+
+					/* Topic time must be in range */
+					if ((channel->topic_time < lopt->topictimemin) ||
+					    (channel->topic_time > lopt->topictimemax))
+						continue;
+
+					/* Must not be on nolist (if it exists) */
+					if (lopt->nolist && find_name_list_match(lopt->nolist, channel->chname))
+						continue;
+
+					/* Must be on yeslist (if it exists) */
+					if (lopt->yeslist && !find_name_list_match(lopt->yeslist, channel->chname))
+						continue;
+				}
+#ifdef LIST_SHOW_MODES
+				modebuf[0] = '[';
+				channel_modes(client, modebuf+1, parabuf, sizeof(modebuf)-1, sizeof(parabuf), channel, 0);
+				if (modebuf[2] == '\0')
+					modebuf[0] = '\0';
+				else
+					strlcat(modebuf, "]", sizeof modebuf);
+#endif
+				if (!ValidatePermissionsForPath("channel:see:list:secret",client,NULL,channel,NULL))
+					sendnumeric(client, RPL_LIST,
+					    ShowChannel(client,
+					    channel) ? channel->chname :
+					    "*", channel->users,
+#ifdef LIST_SHOW_MODES
+					    ShowChannel(client, channel) ?
+					    modebuf : "",
+#endif
+					    ShowChannel(client,
+					    channel) ? (channel->topic ?
+					    channel->topic : "") : "");
+				else
+					sendnumeric(client, RPL_LIST, channel->chname,
+					    channel->users,
+#ifdef LIST_SHOW_MODES
+					    modebuf,
+#endif					    
+					    (channel->topic ? channel->topic : ""));
+				numsend--;
+			}
+		else
 			break;
 	}
 
-	if (x)
+	/* All done */
+	if (hashnum == CHAN_HASH_TABLE_SIZE)
 	{
-		if (x->prev)
+		sendnumeric(client, RPL_LISTEND);
+		free_list_options(client);
+		return 0;
+	}
+
+	/* 
+	 * We've exceeded the limit on the number of channels to send back
+	 * at once.
+	 */
+	lopt->starthash = hashnum;
+	return 1;
+}
+
+EVENT(send_queued_list_data)
+{
+	Client *client, *saved;
+	list_for_each_entry_safe(client, saved, &lclient_list, lclient_node)
+	{
+		if (DoList(client) && IsSendable(client))
 		{
-			/* We will insert ourselves just before this item */
-			new->prev = x->prev;
-			new->next = x;
-			x->prev->next = new;
-			x->prev = new;
-		} else {
-			/* We are the new head */
-			*list = new;
-			new->next = x;
-			x->prev = new;
+			labeled_response_set_context(CHANNELLISTOPTIONS(client)->lr_context);
+			if (!send_list(client))
+			{
+				/* We are done! */
+				labeled_response_force_end();
+			}
+			labeled_response_set_context(NULL);
 		}
-	} else
-	{
-		/* We are the last item */
-		last->next = new;
-		new->prev = last;
 	}
 }
 
-/* NameList functions */
-
-void _add_name_list(NameList **list, char *name)
+/** Called on client exit: free the channel list options of this user */
+void list_md_free(ModData *md)
 {
-	NameList *e = safe_alloc(sizeof(NameList)+strlen(name));
-	strcpy(e->name, name); /* safe, allocated above */
-	AddListItem(e, *list);
-}
+	ChannelListOptions *lopt = (ChannelListOptions *)md->ptr;
 
-void _free_entire_name_list(NameList *n)
-{
-	NameList *n_next;
-
-	for (; n; n = n_next)
-	{
-		n_next = n->next;
-		safe_free(n);
-	}
-}
-
-void _del_name_list(NameList **list, char *name)
-{
-	NameList *e = find_name_list(*list, name);
-	if (e)
-	{
-		DelListItem(e, *list);
-		safe_free(e);
+	if (!lopt)
 		return;
-	}
-}
 
-/** Find an entry in a NameList - case insensitive comparisson.
- * @ingroup ListFunctions
- */
-NameList *find_name_list(NameList *list, char *name)
-{
-	NameList *e;
+	free_entire_name_list(lopt->yeslist);
+	free_entire_name_list(lopt->nolist);
+	safe_free(lopt->lr_context);
 
-	for (e = list; e; e = e->next)
-	{
-		if (!strcasecmp(e->name, name))
-		{
-			return e;
-		}
-	}
-	return NULL;
-}
-
-/** Find an entry in a NameList by running match_simple() on it.
- * @ingroup ListFunctions
- */
-NameList *find_name_list_match(NameList *list, char *name)
-{
-	NameList *e;
-
-	for (e = list; e; e = e->next)
-	{
-		if (match_simple(e->name, name))
-		{
-			return e;
-		}
-	}
-	return NULL;
-}
-
-void add_nvplist(NameValuePrioList **lst, int priority, char *name, char *value)
-{
-	va_list vl;
-	NameValuePrioList *e = safe_alloc(sizeof(NameValuePrioList));
-	safe_strdup(e->name, name);
-	if (value && *value)
-		safe_strdup(e->value, value);
-	AddListItemPrio(e, *lst, priority);
-}
-
-NameValuePrioList *find_nvplist(NameValuePrioList *list, char *name)
-{
-	NameValuePrioList *e;
-
-	for (e = list; e; e = e->next)
-	{
-		if (!strcasecmp(e->name, name))
-		{
-			return e;
-		}
-	}
-	return NULL;
-}
-
-void add_fmt_nvplist(NameValuePrioList **lst, int priority, char *name, FORMAT_STRING(const char *format), ...)
-{
-	char value[512];
-	va_list vl;
-	*value = '\0';
-	if (format)
-	{
-		va_start(vl, format);
-		vsnprintf(value, sizeof(value), format, vl);
-		va_end(vl);
-	}
-	add_nvplist(lst, priority, name, value);
-}
-
-void free_nvplist(NameValuePrioList *lst)
-{
-	NameValuePrioList *e, *e_next;
-	for (e = lst; e; e = e_next)
-	{
-		e_next = e->next;
-		safe_free(e->name);
-		safe_free(e->value);
-		safe_free(e);
-	}
+	safe_free(md->ptr);
 }
