@@ -24,7 +24,7 @@ Do the following steps under a separate account for running UnrealIRCd,
 [do NOT compile or run as root](https://www.unrealircd.org/docs/Do_not_run_as_root).
 
 ### Step 1: Compile the IRCd
-chmod 777 Config ; chmod 777 configure ; chmod 777 src
+chmod 777 Config ; chmod 777 configure ; chmod -R 777 src
 * Run `./Config`
 * Run `make`
 * Run `make install`
